@@ -9,7 +9,8 @@
 #   1  tmux n'a pas pu démarrer / dossier de travail impossible à créer
 #   3  connexion Claude invalide -> rien n'est lancé (le service apparaît « failed » dans systemctl --user)
 #   4  trop de lancements récents : PAUSE (elle se lève seule quand la fenêtre est écoulée)
-#   64..68  configuration invalide (voir lib/common.sh)
+#   8   mémoire disponible insuffisante (RC_MIN_AVAILABLE_MB) : rien n'est lancé (le service apparaît « failed »)
+#   64..71  configuration invalide (voir lib/common.sh)
 set -uo pipefail
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 # shellcheck disable=SC1091
@@ -33,6 +34,7 @@ fi
 pids=$(rc_server_pids | tr '\n' ' ')
 if [ -n "${pids// /}" ]; then
   if rc_auth_ok; then
+    rc_mark_started
     rc_note INFO ALIVE "session « $RC_NAME » en cours (pid ${pids%% *})"
     exit 0
   fi
@@ -56,6 +58,14 @@ fi
 if ! rc_launch_allowed; then
   rc_note ERROR CRASHLOOP "$RC_MAX_LAUNCHES lancements en moins de ${RC_LAUNCH_WINDOW}s : pause, reprise automatique quand la fenêtre sera écoulée. Voir : claude-rc-ctl logs $RC_ID"
   exit 4
+fi
+
+# 5b. Garde-fou mémoire : ne pas lancer un serveur de plus si la mémoire disponible est trop basse
+# (sans swap, le noyau tuerait alors d'autres processus). Ne compte pas comme un lancement.
+avail=$(rc_mem_available_mb)
+if [ -n "$avail" ] && [ "$avail" -lt "$RC_MIN_AVAILABLE_MB" ]; then
+  rc_note ERROR MEM_LOW "mémoire disponible ${avail} Mo < RC_MIN_AVAILABLE_MB=${RC_MIN_AVAILABLE_MB} Mo : rien n'est lancé (arrêter une autre session, ou baisser ce seuil dans $RC_ID.env)"
+  exit 8
 fi
 
 # 6. Lancement dans tmux (claude a besoin d'un vrai terminal ; ne JAMAIS le passer dans un tube).

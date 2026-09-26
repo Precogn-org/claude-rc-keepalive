@@ -7,9 +7,16 @@
 #   CLAUDE_RC_STATE_DIR     journaux, verrous, drapeaux     (défaut : ~/.local/state/claude-rc)
 #   CLAUDE_RC_NOW           heure forcée en secondes
 #   CLAUDE_RC_SCREEN_FILE   texte d'écran forcé (remplace `tmux capture-pane`)
+#   CLAUDE_RC_PROC_ROOT     racine « /proc » (tests)
+#   CLAUDE_RC_MEMINFO       fichier « meminfo » (tests)
+#   CLAUDE_RC_ALLOW_TMP=1   autorise un dossier de travail temporaire (tests uniquement)
 
 : "${CLAUDE_RC_CONFIG_DIR:=${XDG_CONFIG_HOME:-$HOME/.config}/claude-rc}"
 : "${CLAUDE_RC_STATE_DIR:=${XDG_STATE_HOME:-$HOME/.local/state}/claude-rc}"
+
+# Motif (pour pgrep -f / grep -E) d'un serveur `claude remote-control` : « claude » (éventuellement avec son chemin)
+# en premier mot, puis « remote-control ». Ne reconnaît PAS le processus tmux ou bash qui le contient.
+RC_SERVER_PATTERN='^([^ ]*/)?claude remote-control( |$)'
 
 rc_now() { if [ -n "${CLAUDE_RC_NOW:-}" ]; then echo "$CLAUDE_RC_NOW"; else date +%s; fi; }
 
@@ -24,9 +31,15 @@ rc_append()  { local f=$1; shift; rc_mkstate; ( umask 077; printf '%s\n' "$*" >>
 rc_write()   { local f=$1; shift; rc_mkstate; ( umask 077; printf '%s' "$*" > "$f" ); }
 
 # rc_log NIVEAU message...   -> une ligne horodatée (UTC) dans <état>/<id>.log
+# Rotation : au-delà de RC_LOG_MAX_BYTES (1 Mo par défaut) le journal devient <id>.log.1 (une seule génération conservée).
 rc_log() {
   local level=$1; shift
-  rc_append "$CLAUDE_RC_STATE_DIR/${RC_ID:-claude-rc}.log" "$(date -u '+%Y-%m-%dT%H:%M:%SZ') [$level] $*"
+  local f="$CLAUDE_RC_STATE_DIR/${RC_ID:-claude-rc}.log" max=${RC_LOG_MAX_BYTES:-1048576} size
+  rc_append "$f" "$(date -u '+%Y-%m-%dT%H:%M:%SZ') [$level] $*"
+  size=$(stat -c %s "$f" 2>/dev/null || echo 0)
+  if [[ $size =~ ^[0-9]+$ ]] && [[ $max =~ ^[0-9]+$ ]] && [ "$size" -gt "$max" ]; then
+    mv -f "$f" "$f.1" 2>/dev/null || true
+  fi
 }
 
 # rc_note NIVEAU ETAT message...   -> journalise seulement quand l'ETAT change (évite 1 ligne par minute)
@@ -39,9 +52,39 @@ rc_note() {
   fi
 }
 
+# Chemin canonique (liens symboliques résolus) ; si impossible, le chemin tel quel.
+rc_realdir() { readlink -f -- "$1" 2>/dev/null || printf '%s' "$1"; }
+
+# Chaîne entre apostrophes, sûre à écrire dans un fichier shell (même avec espaces, accents, apostrophes).
+rc_squote() { local s=${1//\'/\'\\\'\'}; printf "'%s'" "$s"; }
+
+# Un nom de session est libre (espaces, accents, « / », doubles espaces…) mais : non vide, sans caractère de
+# contrôle, sans « - » initial (il serait pris pour une option), 120 caractères au plus.
+rc_valid_name() {
+  local n=$1
+  [ -n "$n" ] || return 1
+  [ "${#n}" -le 120 ] || return 1
+  case "$n" in -*) return 1 ;; esac
+  [[ $n =~ [[:cntrl:]] ]] && return 1
+  return 0
+}
+
+# Un dossier de travail doit être absolu et durable : jamais /tmp, /var/tmp, /dev/shm, /run (vidés au démarrage).
+rc_valid_dir() {
+  local d=$1
+  case "$d" in /*) ;; *) return 1 ;; esac
+  [ "${CLAUDE_RC_ALLOW_TMP:-0}" = 1 ] && return 0
+  case "$(rc_realdir "$d")" in
+    /tmp|/tmp/*|/var/tmp|/var/tmp/*|/dev/shm|/dev/shm/*|/run|/run/*|/var/run|/var/run/*) return 1 ;;
+  esac
+  return 0
+}
+
 # rc_load_config ID -> charge <config>/<ID>.env et pose les variables RC_*.
 # Codes : 64 identifiant invalide, 65 mode de permission refusé, 66 configuration absente,
-#         67 nom ou dossier déjà utilisé par une autre instance, 68 nom de session invalide.
+#         67 nom ou dossier déjà utilisé par une autre instance, 68 nom de session invalide,
+#         69 dossier de travail refusé (relatif ou temporaire), 70 RC_FALLBACK invalide,
+#         71 réglage numérique invalide.
 rc_load_config() {
   RC_ID=${1:-}
   case "$RC_ID" in
@@ -56,50 +99,85 @@ rc_load_config() {
   : "${RC_DIR:?RC_DIR manquant dans $f}"
   RC_DIR=${RC_DIR%/}
   RC_PERMISSION_MODE=${RC_PERMISSION_MODE:-acceptEdits}
+  RC_FALLBACK=${RC_FALLBACK:-never}
   CLAUDE_BIN=${CLAUDE_BIN:-$HOME/.local/bin/claude}
   RC_TMUX_SESSION=${RC_TMUX_SESSION:-rc-$RC_ID}
   RC_CONTINUE_FAIL_SECONDS=${RC_CONTINUE_FAIL_SECONDS:-45}
   RC_MAX_LAUNCHES=${RC_MAX_LAUNCHES:-3}
   RC_LAUNCH_WINDOW=${RC_LAUNCH_WINDOW:-600}
   RC_STOP_WAIT=${RC_STOP_WAIT:-20}
-  # Pas d'espace ni de caractère spécial dans le nom : la détection du processus se fait sur sa ligne de commande.
-  case "$RC_NAME" in
-    *[!A-Za-z0-9._-]*) echo "RC_NAME invalide : '$RC_NAME' (lettres, chiffres, . _ - seulement, sans espace)" >&2; return 68 ;;
-  esac
+  RC_MIN_AVAILABLE_MB=${RC_MIN_AVAILABLE_MB:-1024}
+  RC_LOG_MAX_BYTES=${RC_LOG_MAX_BYTES:-1048576}
+  rc_valid_name "$RC_NAME" || { echo "RC_NAME invalide : '$RC_NAME' (1 à 120 caractères, sans caractère de contrôle, ne commence pas par « - »)" >&2; return 68; }
+  rc_valid_dir "$RC_DIR" || { echo "RC_DIR refusé : '$RC_DIR' (chemin absolu et durable requis ; jamais /tmp, /var/tmp, /dev/shm, /run)" >&2; return 69; }
   # Liste blanche volontairement courte : jamais de bypassPermissions, ni de dontAsk, ni d'auto.
   case "$RC_PERMISSION_MODE" in
     default|acceptEdits|plan) ;;
     *) echo "mode de permission refusé : '$RC_PERMISSION_MODE' (autorisés : default, acceptEdits, plan)" >&2; return 65 ;;
   esac
+  case "$RC_FALLBACK" in
+    never|norecord) ;;
+    *) echo "RC_FALLBACK invalide : '$RC_FALLBACK' (never ou norecord)" >&2; return 70 ;;
+  esac
+  local v
+  for v in "$RC_CONTINUE_FAIL_SECONDS" "$RC_MAX_LAUNCHES" "$RC_LAUNCH_WINDOW" "$RC_STOP_WAIT" "$RC_MIN_AVAILABLE_MB" "$RC_LOG_MAX_BYTES"; do
+    [[ $v =~ ^[0-9]+$ ]] || { echo "réglage numérique invalide : '$v'" >&2; return 71; }
+  done
   RC_STOP_FLAG="$CLAUDE_RC_STATE_DIR/$RC_ID.stop"
   RC_LAUNCHES="$CLAUDE_RC_STATE_DIR/$RC_ID.launches"
+  RC_STARTED="$CLAUDE_RC_STATE_DIR/$RC_ID.started"
   rc_check_unique "$f" || return 67
   return 0
 }
 
-# Deux instances ne doivent partager NI le nom NI le dossier : --continue est lié au dossier, et la détection
-# du processus au nom ; un partage ferait reprendre ou doubler la mauvaise session.
+# Deux instances ne doivent partager NI le nom NI le dossier : --continue est lié au dossier, et un serveur
+# refuse de démarrer là où un autre tourne ; un partage ferait reprendre ou doubler la mauvaise session.
 rc_check_unique() {
-  local self=$1 other o_name o_dir
+  local self=$1 other o_name o_dir mydir
+  mydir=$(rc_realdir "$RC_DIR")
   for other in "$CLAUDE_RC_CONFIG_DIR"/*.env; do
     [ -e "$other" ] && [ "$other" != "$self" ] || continue
     o_name=$( . "$other" >/dev/null 2>&1; printf '%s' "${RC_NAME:-}" )
     o_dir=$( . "$other" >/dev/null 2>&1; printf '%s' "${RC_DIR:-}" )
-    o_dir=${o_dir%/}
+    o_dir=$(rc_realdir "${o_dir%/}")
     if [ "$o_name" = "$RC_NAME" ]; then echo "RC_NAME '$RC_NAME' déjà utilisé par $(basename "$other")" >&2; return 1; fi
-    if [ "$o_dir" = "$RC_DIR" ]; then echo "RC_DIR '$RC_DIR' déjà utilisé par $(basename "$other")" >&2; return 1; fi
+    if [ "$o_dir" = "$mydir" ]; then echo "RC_DIR '$RC_DIR' déjà utilisé par $(basename "$other")" >&2; return 1; fi
   done
   return 0
 }
 
 rc_escape_ere() { printf '%s' "$1" | sed 's/[][\.*^$+?(){}|/]/\\&/g'; }
 
-# PID(s) du serveur `claude remote-control --name <RC_NAME>` de l'utilisateur courant.
-# Détection par le processus (et non par le nom de la session tmux) : une session lancée à la main
-# est ainsi « adoptée » au lieu d'être doublée.
+# PID(s) du serveur `claude remote-control` de l'utilisateur courant QUI TRAVAILLE DANS RC_DIR.
+# Détection par le DOSSIER DE TRAVAIL du processus (/proc/<pid>/cwd), pas par son nom : le nom peut contenir
+# n'importe quoi (espaces, accents…) et deux sessions ne partagent jamais un dossier. Une session lancée à la main
+# dans le même dossier est ainsi « adoptée » au lieu d'être doublée.
 rc_server_pids() {
-  local name; name=$(rc_escape_ere "$RC_NAME")
-  pgrep -u "$(id -u)" -f "^([^ ]*/)?claude remote-control --name ${name}( |\$)" 2>/dev/null || true
+  local proc=${CLAUDE_RC_PROC_ROOT:-/proc} want pid cwd
+  want=$(rc_realdir "$RC_DIR")
+  for pid in $(pgrep -u "$(id -u)" -f "$RC_SERVER_PATTERN" 2>/dev/null); do
+    cwd=$(readlink -f -- "$proc/$pid/cwd" 2>/dev/null) || continue
+    [ "$cwd" = "$want" ] && echo "$pid"
+  done
+  return 0
+}
+
+# Mémoire réellement disponible (Mo), depuis /proc/meminfo ; vide si illisible.
+rc_mem_available_mb() {
+  local f=${CLAUDE_RC_MEMINFO:-/proc/meminfo} kb
+  kb=$(awk '/^MemAvailable:/ {print $2; exit}' "$f" 2>/dev/null)
+  [[ $kb =~ ^[0-9]+$ ]] && echo $((kb / 1024))
+  return 0
+}
+
+# Mémoire résidente (Ko) d'un processus et de tous ses descendants.
+rc_tree_rss_kb() {
+  ps -eo pid=,ppid=,rss= 2>/dev/null | awk -v root="$1" '
+    { p[$1] = $2; r[$1] = $3 }
+    END { tot = 0
+          for (i in p) { x = i; n = 0
+            while (x != "" && x != 0 && n++ < 64) { if (x == root) { tot += r[i]; break }; x = p[x] } }
+          print tot }'
 }
 
 # API Anthropic joignable ? (toute réponse HTTP suffit ; seule une panne réseau/DNS/TLS échoue)
@@ -143,3 +221,7 @@ rc_launch_allowed() {
   [ "$kept" -lt "$RC_MAX_LAUNCHES" ]
 }
 rc_record_launch() { rc_append "$RC_LAUNCHES" "$(rc_now)"; }
+
+# Marque « cette instance a déjà démarré au moins une fois » : `claude-rc-ctl enable` l'exige (sinon la première
+# session doit d'abord être créée explicitement par `claude-rc-ctl fresh <id> --yes`).
+rc_mark_started() { rc_write "$RC_STARTED" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"; }

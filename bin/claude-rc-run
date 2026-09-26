@@ -3,22 +3,25 @@
 # précédente (--continue) ; en cas d'échec, le MESSAGE affiché décide (le code de sortie est toujours 1).
 #
 # Usage : claude-rc-run <id> [--fresh]     (appelé par claude-rc-ensure, pas à la main)
-#   --fresh   ne tente pas --continue : crée directement une nouvelle session
+#   --fresh   ne tente pas --continue : crée directement une nouvelle session (demande explicite : claude-rc-ctl fresh)
 #
 # Messages de Claude Code 2.1.282 (extraits du binaire ; voir docs/VERIFIED.md) et décision :
 #   « Resuming session … »                            reprise engagée            -> jamais de nouvelle session
-#   « No recent session found in this directory … »   rien à reprendre (1re fois ou > ~4 h) -> NOUVELLE session
-#   « … has no environment_id … »                     session jamais rattachée   -> NOUVELLE session
-#   « … already being served by another … instance »  la session est déjà servie -> RIEN (doublon évité)
-#   « Another … instance … already running … »        idem (course entre deux lancements) -> RIEN
-#   tout autre message (ou écran vide)                inconnu (réseau, serveur…) -> RIEN, on réessaie plus tard
+#   « No recent session found in this directory … »   rien à reprendre (1re fois ou > ~4 h)
+#                                                        -> RC_FALLBACK=never (défaut) : RIEN, code 7 (décision humaine)
+#                                                        -> RC_FALLBACK=norecord      : NOUVELLE session (seul cas autorisé)
+#   « … has no environment_id … »                     session jamais rattachée   -> RIEN, code 6 (décision humaine)
+#   « … already being served by another … instance »  la session est déjà servie -> RIEN, code 5 (doublon évité)
+#   « Another … instance … already running … »        idem (course entre deux lancements) -> RIEN, code 5
+#   tout autre message (ou écran vide)                inconnu (réseau, serveur…) -> RIEN, code 6, on réessaie plus tard
 # Règles :
 #  - claude reste attaché au terminal de tmux : jamais de tube (| tee), il quitterait aussitôt.
 #  - une session qui a tourné au moins RC_CONTINUE_FAIL_SECONDS n'est jamais remplacée ici.
-#  - créer une nouvelle session est réservé aux cas « rien à reprendre » ; sinon c'est une décision humaine :
-#    claude-rc-ctl fresh <id> --yes
+#  - aucune nouvelle session sans autorisation explicite : `claude-rc-ctl fresh <id> --yes`, ou RC_FALLBACK=norecord
+#    (limité au seul message « No recent session found »).
 #
-# Codes de sortie : ceux de claude ; 5 = session déjà servie par une autre instance ; 6 = échec inconnu de --continue.
+# Codes de sortie : ceux de claude ; 5 = session déjà servie par une autre instance ; 6 = échec inconnu de --continue ;
+#                   7 = rien à reprendre et RC_FALLBACK=never.
 set -uo pipefail
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 # shellcheck disable=SC1091
@@ -30,9 +33,12 @@ cd "$RC_DIR" || { rc_log ERROR "dossier de travail introuvable : $RC_DIR"; exit 
 
 args=(remote-control --name "$RC_NAME" --permission-mode "$RC_PERMISSION_MODE")
 
+# Une NOUVELLE session pose, la première fois dans un dossier, la question interactive « Spawn mode ? [1/2] » qui
+# bloquerait un démarrage sans humain : le mode est donc donné explicitement (same-dir = le défaut de Claude Code).
 start_fresh() {
+  rc_mark_started
   start=$(rc_mono)
-  "$CLAUDE_BIN" "${args[@]}"
+  "$CLAUDE_BIN" "${args[@]}" --spawn same-dir
   rc=$?
   elapsed=$(( $(rc_mono) - start ))
 }
@@ -42,6 +48,7 @@ if [ "$fresh_only" = 1 ]; then
   start_fresh
 else
   rc_log INFO "démarrage de « $RC_NAME » dans $RC_DIR : tentative de reprise (--continue)"
+  rc_mark_started
   start=$(rc_mono)
   "$CLAUDE_BIN" "${args[@]}" --continue
   rc=$?
@@ -53,13 +60,21 @@ else
     case "$screen" in
       *"Resuming session"*)
         rc_log WARN "la reprise était engagée puis le processus s'est arrêté (code $rc après ${elapsed}s) : pas de nouvelle session. Dernières lignes : $last" ;;
-      *"No recent session found"*|*"has no environment_id"*)
-        if rc_network_ok; then
-          rc_log WARN "rien à reprendre (code $rc après ${elapsed}s : $last) : NOUVELLE session « $RC_NAME ». L'ancienne éventuelle restera hors ligne dans claude.ai/code : à archiver."
-          start_fresh
+      *"No recent session found"*)
+        if [ "$RC_FALLBACK" = norecord ]; then
+          if rc_network_ok; then
+            rc_log WARN "rien à reprendre (code $rc après ${elapsed}s : $last) : RC_FALLBACK=norecord -> NOUVELLE session « $RC_NAME ». L'ancienne éventuelle restera hors ligne dans claude.ai/code : à archiver."
+            start_fresh
+          else
+            rc_log WARN "rien à reprendre mais l'API est injoignable : pas de nouvelle session, nouvel essai au prochain passage du minuteur"
+          fi
         else
-          rc_log WARN "rien à reprendre mais l'API est injoignable : pas de nouvelle session, nouvel essai au prochain passage du minuteur"
+          rc_log ERROR "rien à reprendre dans $RC_DIR (${last:-<écran vide>}) et RC_FALLBACK=never : AUCUNE nouvelle session créée. Pour en créer une volontairement : claude-rc-ctl fresh $RC_ID --yes"
+          exit 7
         fi ;;
+      *"has no environment_id"*)
+        rc_log ERROR "la session à reprendre n'a jamais été rattachée à un serveur : AUCUNE nouvelle session créée. Message : $last. Décision humaine : claude-rc-ctl fresh $RC_ID --yes"
+        exit 6 ;;
       *"already being served"*|*"already running in this directory"*|*"split-brain"*)
         rc_log ERROR "la session est déjà servie par une autre instance : AUCUNE nouvelle session créée. Message : $last"
         exit 5 ;;

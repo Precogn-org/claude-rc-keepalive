@@ -45,6 +45,30 @@ ne devaient rien toucher au serveur (unités transitoires uniquement, jamais de 
 | Fichiers d'état avec `umask 0002` **avant** correction | 664 (dossier 700) ; **après** correction : 600, dossier 700, dossier de travail inchangé |
 | Lecture de l'écran par `tmux capture-pane -t $TMUX_PANE` avec un **vrai tmux** | les messages d'erreur de claude sont lus après la sortie du processus (4 scénarios vérifiés) |
 
+## Vérifié sur le serveur avec la v2.2 (une vraie session, 26 septembre 2026)
+
+| Point | Résultat |
+|---|---|
+| `install.sh` sur le serveur | dossiers 700, scripts 755, unités 644, exemple de configuration 600 ; **aucune session créée, rien démarré ni activé** |
+| `claude-rc-ctl create` | écrit la configuration en 600 après validation ; ne démarre rien |
+| Premier lancement `--fresh` dans un dossier | Claude Code pose la question interactive **« Spawn mode ? [1/2] »** et **ignore `SIGTERM` pendant l'attente** ; `--spawn same-dir` (désormais transmis pour les nouvelles sessions) évite la question |
+| Session créée avec un nom contenant `/` | connectée, nom exactement celui configuré, « Capacity 1/32 … new sessions will be created in the current directory » |
+| Mémoire d'une session au repos | **370 Mo** résidents (serveur 144 Mo + enfant 235 Mo) ; « disponible » du système en baisse d'environ 150 Mo (pages partagées), 6577 → 6430 Mo |
+| `enable` + premier passage du minuteur | le serveur vivant a été **adopté** (pas de seconde session), une session tmux, un serveur |
+| `SIGTERM` sur le serveur, sans drapeau d'arrêt | le minuteur a relancé avec `--continue` **67 s plus tard** : même `sessionId`, même `environmentId`, nouveau pid, un seul serveur |
+| `claude-rc-ctl restart` pendant la pause anti-boucle (3 lancements en 10 min, provoqués par l'essai lui-même) | rien n'a été lancé (défaut, corrigé : les commandes humaines remettent le compteur à zéro) ; le minuteur a repris seul à la fin de la fenêtre (environ 4 min plus tard), mêmes `sessionId` et `environmentId` |
+| Détection du serveur par le dossier de travail | le minuteur adopte le serveur dont `/proc/<pid>/cwd` est le dossier de l'instance, quel que soit son nom |
+| Chargement des `CLAUDE.md` depuis un sous-dossier d'un dépôt (`claude -p`) | `~/CLAUDE.md` et le `CLAUDE.md` du dépôt (dossier parent) ont été chargés |
+| `acceptEdits`, sans dossier additionnel (`claude -p`) | écrire **et lire** un fichier dans un autre projet : **refusé** |
+| `acceptEdits` + `--add-dir <dossier>` | écrire dans ce dossier : **autorisé** |
+| `acceptEdits` + `permissions.additionalDirectories` dans un fichier de réglages (`--settings fichier`, et `<dossier>/.claude/settings.local.json`) | écrire et lire dans un autre projet : **autorisé** |
+| `CLAUDE.md` d'un dossier additionnel | chargé seulement avec `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD` (set to `1`) (observé avec `claude -p`) |
+| `claude remote-control --help` | **aucune option `--add-dir`** (seulement `--spawn`, `--capacity`, `--permission-mode`, `--continue`…) |
+| `claude -p` lit l'entrée standard | quand un script était envoyé à `ssh … bash -s`, `claude -p` a avalé la suite du script : toujours utiliser `</dev/null` |
+
+Reste à confirmer depuis un téléphone : qu'une session lancée par Remote Control applique le même réglage de dossiers
+additionnels (mêmes sources de réglages, mais pas encore observé depuis l'appli mobile).
+
 ## Comportement de `claude remote-control` (extrait du binaire 2.1.282, à revérifier à chaque mise à jour)
 
 Le code de sortie est **toujours 1** : seuls les messages permettent de distinguer les cas. Ils sont affichés sur l'erreur standard.
@@ -52,8 +76,8 @@ Le code de sortie est **toujours 1** : seuls les messages permettent de distingu
 | Message (début) | Signification | Décision de `claude-rc-run` |
 |---|---|---|
 | `Resuming session <id> (<âge>) …` | reprise engagée (annonce avant la connexion) | jamais de nouvelle session |
-| `Error: No recent session found in this directory or its worktrees.` | rien d'enregistré pour ce dossier (première fois, ou trop ancien : ~4 h) ; **sortie immédiate, avant tout appel réseau** | nouvelle session (si l'API est joignable) |
-| `Error: Session <id> has no environment_id.` | session jamais rattachée à un serveur | nouvelle session |
+| `Error: No recent session found in this directory or its worktrees.` | rien d'enregistré pour ce dossier (première fois, ou trop ancien : ~4 h) ; **sortie immédiate, avant tout appel réseau** | **rien, code 7** (`RC_FALLBACK=never` par défaut) ; nouvelle session seulement avec `RC_FALLBACK=norecord` et API joignable |
+| `Error: Session <id> has no environment_id.` | session jamais rattachée à un serveur | **rien** (code 6) |
 | `Error: Session <id> is already being served by another claude remote-control instance (pid N) …` | doublon : un autre processus sert déjà la session | **rien** (code 5) |
 | `Error: Environment <id> is already being served by another … (pid N) …` | idem | **rien** (code 5) |
 | `Error: Another claude remote-control instance (pid N) is already running in this directory. Exiting to avoid a split-brain conflict.` | course entre deux lancements | **rien** (code 5) |
@@ -80,8 +104,8 @@ Le code de sortie est **toujours 1** : seuls les messages permettent de distingu
 
 - **Une instance = un dossier de travail = un nom de session**, uniques (`--continue` est lié au dossier).
 - **Mode « session unique » après reprise** : pas de nouvelles sessions depuis le téléphone.
-- **Nouvelle session** dans les seuls cas « rien à reprendre » ; l'ancienne reste « hors ligne » dans claude.ai/code : à archiver.
-- **`/tmp`** convient à un essai, pas à un travail réel.
+- **Nouvelle session** seulement sur demande explicite (`claude-rc-ctl fresh <id> --yes`) ou avec `RC_FALLBACK=norecord` dans le cas « rien à reprendre » ; l'ancienne reste « hors ligne » dans claude.ai/code : à archiver.
+- **`/tmp`, `/var/tmp`, `/dev/shm` et `/run`** sont refusés comme dossiers de travail (vidés au démarrage).
 - **Les journaux** contiennent les décisions du script et, en cas d'échec, les dernières lignes affichées par claude.
 - Avertissements `Found left-over process … Ignoring` dans le journal systemd utilisateur à chaque passage (conséquence de
   `KillMode=process`) ; une conception plus propre (tmux dans sa propre unité transitoire) n'est pas encore testée.

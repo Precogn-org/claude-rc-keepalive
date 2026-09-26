@@ -45,6 +45,30 @@ tests, and a Windows workstation with WSL Ubuntu 24.04 (**real systemd 255**) fo
 | State files with `umask 0002` **before** the fix | 664; **after**: 600 in a 700 directory, working directory unchanged |
 | Screen reading with `tmux capture-pane -t $TMUX_PANE` and a **real tmux** | claude's error messages are read after the process exits (4 scenarios verified) |
 
+## Verified on the server with v2.2 (one real session, 26 Sep 2026)
+
+| Point | Result |
+|---|---|
+| `install.sh` on the server | directories 700, scripts 755, units 644, example config 600; **no session created, nothing started or enabled** |
+| `claude-rc-ctl create` | writes the configuration in mode 600 after validation; starts nothing |
+| First `--fresh` launch in a folder | Claude Code asks interactively **"Spawn mode? [1/2]"** and **ignores `SIGTERM` while waiting**; `--spawn same-dir` (now passed on new sessions) avoids the question |
+| Session created with a name containing `/` | connected, name exactly as configured, "Capacity 1/32 … new sessions will be created in the current directory" |
+| Memory of one idle session | **370 MB** resident (server 144 MB + child 235 MB); system-wide "available" dropped by ~150 MB (shared pages), 6577 → 6430 MB |
+| `enable` + first timer pass | the live server was **adopted** (no second session), one tmux session, one server |
+| `SIGTERM` on the server, no stop flag | the timer relaunched with `--continue` **67 s later**: same `sessionId`, same `environmentId`, new pid, one server |
+| `claude-rc-ctl restart` while the anti-loop was paused (3 launches in 10 min, caused by the test itself) | nothing was started (defect, fixed: human commands reset the counter); the timer resumed by itself when the window elapsed (about 4 min later), same `sessionId` and `environmentId` |
+| Server detection by working directory | the timer adopts the server whose `/proc/<pid>/cwd` is the instance folder, whatever its name |
+| `CLAUDE.md` loading from a subfolder of a repository (`claude -p`) | both `~/CLAUDE.md` and the repository's `CLAUDE.md` (parent folder) were loaded |
+| `acceptEdits`, no additional directory (`claude -p`) | writing **and reading** a file in another project: **denied** |
+| `acceptEdits` + `--add-dir <dir>` | writing in that folder: **allowed** |
+| `acceptEdits` + `permissions.additionalDirectories` in a settings file (`--settings file`, and `<dir>/.claude/settings.local.json`) | writing and reading in another project: **allowed** |
+| `CLAUDE.md` of an additional directory | loaded only with `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD` (set to `1`) (observed with `claude -p`) |
+| `claude remote-control --help` | **no `--add-dir` option** (only `--spawn`, `--capacity`, `--permission-mode`, `--continue`…) |
+| `claude -p` reads standard input | when a script was piped to `ssh … bash -s`, `claude -p` swallowed the rest of the script: always use `</dev/null` |
+
+Still to confirm on a phone: that a session spawned by Remote Control applies the same additional-directory setting
+(same settings sources, but not yet observed from the mobile app).
+
 ## Behaviour of `claude remote-control` (extracted from the 2.1.282 binary; re-check at every update)
 
 The exit code is **always 1**: only the messages tell the cases apart. They are printed on standard error.
@@ -52,8 +76,8 @@ The exit code is **always 1**: only the messages tell the cases apart. They are 
 | Message (start) | Meaning | Decision of `claude-rc-run` |
 |---|---|---|
 | `Resuming session <id> (<age>) …` | resume started (announced before connecting) | never a new session |
-| `Error: No recent session found in this directory or its worktrees.` | nothing recorded for this directory (first time, or too old: ~4 h); **immediate exit, before any network call** | new session (if the API is reachable) |
-| `Error: Session <id> has no environment_id.` | session never attached to a server | new session |
+| `Error: No recent session found in this directory or its worktrees.` | nothing recorded for this directory (first time, or too old: ~4 h); **immediate exit, before any network call** | **nothing, exit 7** (default `RC_FALLBACK=never`); new session only with `RC_FALLBACK=norecord` and a reachable API |
+| `Error: Session <id> has no environment_id.` | session never attached to a server | **nothing** (code 6) |
 | `Error: Session <id> is already being served by another claude remote-control instance (pid N) …` | duplicate: another process already serves the session | **nothing** (code 5) |
 | `Error: Environment <id> is already being served by another … (pid N) …` | same | **nothing** (code 5) |
 | `Error: Another claude remote-control instance (pid N) is already running in this directory. Exiting to avoid a split-brain conflict.` | race between two launches | **nothing** (code 5) |
@@ -79,8 +103,8 @@ The exit code is **always 1**: only the messages tell the cases apart. They are 
 - **One instance = one working directory = one session name**, all unique (`--continue` is tied to the directory, and a
   server refuses to start where another one already runs).
 - **"Single session" mode after a resume**: no new sessions from the phone.
-- **A new session** only in the "nothing to resume" cases; the old one stays "offline" in claude.ai/code: archive it.
-- **`/tmp`** is fine for a test, not for real work.
+- **A new session** only on explicit request (`claude-rc-ctl fresh <id> --yes`) or with `RC_FALLBACK=norecord` in the "nothing to resume" case; the old one stays "offline" in claude.ai/code: archive it.
+- **`/tmp`, `/var/tmp`, `/dev/shm` and `/run`** are refused as working directories (emptied at boot).
 - **Logs** contain the script's decisions and, on failure, the last lines printed by claude.
 - **`Found left-over process … Ignoring` warnings** in the systemd user journal at every pass (consequence of
   `KillMode=process`); a cleaner design (tmux in its own transient scope) is not tested yet.

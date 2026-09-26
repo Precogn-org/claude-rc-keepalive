@@ -11,8 +11,8 @@ OnBootSec=60s
 OnUnitInactiveSec=60s
 # Précision par défaut = 1 min (mesuré le 25/09 : détection après 69 s) ; on la ramène à 1 s.
 AccuracySec=1s
-# Étale d'au plus 10 s les lancements quand plusieurs instances existent (évite N démarrages simultanés au boot).
-RandomizedDelaySec=10s
+# Étale d'au plus 30 s les lancements quand plusieurs instances existent (évite N démarrages simultanés au boot).
+RandomizedDelaySec=30s
 
 [Install]
 WantedBy=timers.target
