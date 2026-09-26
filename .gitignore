@@ -1,0 +1,7 @@
+# Ne jamais publier : configurations réelles, journaux, liste personnelle de termes interdits
+*.env
+!conf/*.env.example
+tests/private-patterns.local
+*.log
+*.lock
+state/

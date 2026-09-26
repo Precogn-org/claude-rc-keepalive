@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# claude-rc-ensure : s'assure qu'une session Remote Control tourne. Idempotent : appelé chaque minute par le minuteur.
+#
+# Usage : claude-rc-ensure <id>        (variable optionnelle : RC_FORCE_FRESH=1 -> nouvelle session, sans --continue)
+#
+# Codes de sortie :
+#   0  tout va bien (session en cours, lancée à l'instant, arrêt volontaire, réseau momentanément absent,
+#      ou une autre exécution est déjà en train de vérifier)
+#   1  tmux n'a pas pu démarrer / dossier de travail impossible à créer
+#   3  connexion Claude invalide -> rien n'est lancé (le service apparaît « failed » dans systemctl --user)
+#   4  trop de lancements récents : PAUSE (elle se lève seule quand la fenêtre est écoulée)
+#   64..68  configuration invalide (voir lib/common.sh)
+set -uo pipefail
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+# shellcheck disable=SC1091
+. "$HERE/common.sh" 2>/dev/null || . "$HERE/../lib/common.sh"
+
+rc_load_config "${1:-}" || exit $?
+
+# 0. Une seule exécution à la fois par instance (le minuteur et une commande manuelle peuvent se croiser).
+if ! rc_lock; then
+  rc_note INFO LOCKED "une autre vérification est en cours pour '$RC_ID' : je la laisse faire"
+  exit 0
+fi
+
+# 1. Arrêt volontaire demandé ? (claude-rc-ctl stop <id>)
+if [ -e "$RC_STOP_FLAG" ]; then
+  rc_note INFO STOPPED "arrêt volontaire actif ($RC_STOP_FLAG) : je ne relance pas. Pour reprendre : claude-rc-ctl start $RC_ID"
+  exit 0
+fi
+
+# 2. Déjà en cours ? (y compris une session lancée à la main : elle est adoptée, jamais doublée)
+pids=$(rc_server_pids | tr '\n' ' ')
+if [ -n "${pids// /}" ]; then
+  if rc_auth_ok; then
+    rc_note INFO ALIVE "session « $RC_NAME » en cours (pid ${pids%% *})"
+    exit 0
+  fi
+  rc_note ERROR ALIVE_AUTH_KO "session en cours MAIS connexion Claude invalide : elle ne progressera plus. Refaire : claude auth login"
+  exit 3
+fi
+
+# 3. Réseau. Sans lui, on ne lance RIEN.
+if ! rc_network_ok; then
+  rc_note WARN NET_KO "API Anthropic injoignable : pas de lancement, nouvel essai dans 1 minute"
+  exit 0
+fi
+
+# 4. Connexion Claude.
+if ! rc_auth_ok; then
+  rc_note ERROR AUTH_KO "connexion Claude invalide (claude auth status) : rien n'est lancé. Refaire : claude auth login"
+  exit 3
+fi
+
+# 5. Anti-boucle (pause, pas arrêt définitif).
+if ! rc_launch_allowed; then
+  rc_note ERROR CRASHLOOP "$RC_MAX_LAUNCHES lancements en moins de ${RC_LAUNCH_WINDOW}s : pause, reprise automatique quand la fenêtre sera écoulée. Voir : claude-rc-ctl logs $RC_ID"
+  exit 4
+fi
+
+# 6. Lancement dans tmux (claude a besoin d'un vrai terminal ; ne JAMAIS le passer dans un tube).
+mkdir -p "$RC_DIR" || { rc_log ERROR "impossible de créer $RC_DIR"; exit 1; }
+tmux has-session -t "$RC_TMUX_SESSION" 2>/dev/null && tmux kill-session -t "$RC_TMUX_SESSION" 2>/dev/null   # session tmux morte/orpheline
+fresh=""; [ "${RC_FORCE_FRESH:-0}" = 1 ] && fresh=" --fresh"
+cmd="$(printf '%q %q' "$HERE/claude-rc-run" "$RC_ID")$fresh"
+# 9>&- : le verrou ne doit pas être hérité par le serveur tmux (sinon il resterait verrouillé indéfiniment).
+if tmux new-session -d -s "$RC_TMUX_SESSION" -c "$RC_DIR" "$cmd" 9>&-; then
+  rc_record_launch
+  if [ -n "$fresh" ]; then
+    rc_note INFO LAUNCHED "lancement dans tmux '$RC_TMUX_SESSION' (dossier $RC_DIR) : NOUVELLE session demandée"
+  else
+    rc_note INFO LAUNCHED "lancement dans tmux '$RC_TMUX_SESSION' (dossier $RC_DIR) : reprise par --continue"
+  fi
+  exit 0
+fi
+rc_log ERROR "tmux n'a pas pu démarrer la session '$RC_TMUX_SESSION'"
+exit 1

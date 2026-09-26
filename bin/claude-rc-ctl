@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# claude-rc-ctl : pilotage manuel d'une session Remote Control gérée par claude-rc-keepalive.
+#
+# Usage : claude-rc-ctl <commande> <id> [option]
+#   status          état complet (arrêt volontaire, processus, tmux, connexion Claude, journal)
+#   stop            arrêt VOLONTAIRE : crée le drapeau, arrête la session ; le minuteur ne la relancera pas
+#   start           retire le drapeau, remet le compteur anti-boucle à zéro et lance (reprise par --continue)
+#   restart         arrête le processus SANS drapeau, attend sa disparition, relance avec --continue
+#   fresh --yes     crée une NOUVELLE session (sans --continue) : l'ancienne restera hors ligne dans claude.ai
+#   logs [n]        les n dernières lignes du journal (défaut 50)
+#   screen          l'écran actuel de la session tmux (lecture seule)
+set -uo pipefail
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+# shellcheck disable=SC1091
+. "$HERE/common.sh" 2>/dev/null || . "$HERE/../lib/common.sh"
+
+usage() { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 64; }
+cmd=${1:-}; id=${2:-}
+[ -n "$cmd" ] && [ -n "$id" ] || usage
+rc_load_config "$id" || exit $?
+
+# Arrête le(s) serveur(s) avec SIGTERM et ATTEND leur disparition (max 20 s) : relancer trop tôt ferait échouer
+# --continue avec « already being served » (ou pire, laisserait deux serveurs).
+stop_processes() {
+  local pids i
+  pids=$(rc_server_pids | tr '\n' ' ')
+  # shellcheck disable=SC2086
+  [ -n "${pids// /}" ] && kill -TERM $pids 2>/dev/null
+  for i in $(seq 1 "$RC_STOP_WAIT"); do
+    [ -z "$(rc_server_pids)" ] && break
+    sleep 1
+  done
+  if [ -n "$(rc_server_pids)" ]; then echo "le serveur est toujours en cours après ${RC_STOP_WAIT} s (pid $(rc_server_pids | tr '\n' ' ')) : abandon" >&2; return 1; fi
+  tmux kill-session -t "$RC_TMUX_SESSION" 2>/dev/null
+  return 0
+}
+
+case "$cmd" in
+  status)
+    pids=$(rc_server_pids | tr '\n' ' ')
+    echo "identifiant        : $RC_ID"
+    echo "nom (claude.ai)    : $RC_NAME"
+    echo "dossier            : $RC_DIR"
+    echo "mode de permission : $RC_PERMISSION_MODE"
+    [ -e "$RC_STOP_FLAG" ] && echo "arrêt volontaire   : OUI (depuis $(cat "$RC_STOP_FLAG"))" || echo "arrêt volontaire   : non"
+    [ -n "${pids// /}" ] && echo "processus serveur  : en cours (pid $pids)" || echo "processus serveur  : aucun"
+    tmux has-session -t "$RC_TMUX_SESSION" 2>/dev/null && echo "session tmux       : $RC_TMUX_SESSION (existe)" || echo "session tmux       : $RC_TMUX_SESSION (absente)"
+    rc_auth_ok && echo "connexion Claude   : OK" || echo "connexion Claude   : INVALIDE (refaire : claude auth login)"
+    n=$(grep -Ec '^[0-9]+$' "$RC_LAUNCHES" 2>/dev/null || true)
+    echo "lancements récents : ${n:-0} (pause au-delà de $RC_MAX_LAUNCHES par ${RC_LAUNCH_WINDOW}s)"
+    echo "--- journal (8 dernières lignes)"
+    tail -n 8 "$CLAUDE_RC_STATE_DIR/$RC_ID.log" 2>/dev/null || echo "(journal vide)"
+    ;;
+  stop)
+    rc_mkstate
+    rc_write "$RC_STOP_FLAG" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    rc_log INFO "arrêt volontaire demandé (claude-rc-ctl stop)"
+    stop_processes || exit 1
+    echo "arrêté. Le minuteur ne relancera pas '$RC_ID' tant que vous n'aurez pas fait : claude-rc-ctl start $RC_ID"
+    ;;
+  start)
+    rm -f "$RC_STOP_FLAG" "$CLAUDE_RC_STATE_DIR/$RC_ID.last"
+    ( umask 077; : > "$RC_LAUNCHES" ) 2>/dev/null || true
+    rc_log INFO "démarrage demandé (claude-rc-ctl start)"
+    exec "$HERE/claude-rc-ensure" "$RC_ID"
+    ;;
+  restart)
+    rc_log INFO "redémarrage demandé (claude-rc-ctl restart)"
+    stop_processes || exit 1
+    rm -f "$CLAUDE_RC_STATE_DIR/$RC_ID.last"
+    exec "$HERE/claude-rc-ensure" "$RC_ID"
+    ;;
+  fresh)
+    if [ "${3:-}" != "--yes" ]; then
+      echo "Cette commande crée une NOUVELLE session claude.ai « $RC_NAME » : l'ancienne restera hors ligne dans claude.ai/code (à archiver)." >&2
+      echo "Confirmez avec : claude-rc-ctl fresh $RC_ID --yes" >&2
+      exit 64
+    fi
+    rc_log WARN "NOUVELLE session demandée (claude-rc-ctl fresh --yes)"
+    rm -f "$RC_STOP_FLAG" "$CLAUDE_RC_STATE_DIR/$RC_ID.last"
+    stop_processes || exit 1
+    RC_FORCE_FRESH=1 exec "$HERE/claude-rc-ensure" "$RC_ID"
+    ;;
+  logs)
+    tail -n "${3:-50}" "$CLAUDE_RC_STATE_DIR/$RC_ID.log" 2>/dev/null || echo "(journal vide)"
+    ;;
+  screen)
+    tmux capture-pane -p -t "$RC_TMUX_SESSION" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -30 || echo "(pas de session tmux)"
+    ;;
+  *) usage ;;
+esac

@@ -1,0 +1,21 @@
+# claude-rc-keepalive : unité « modèle » (template). L'instance (%i) est l'identifiant de la session,
+# ex. claude-rc@test-vps-cli.service <-> ~/.config/claude-rc/test-vps-cli.env
+#
+# Ce service ne fait QUE vérifier/relancer : il se termine en une seconde (Type=oneshot).
+# C'est le minuteur claude-rc@.timer qui le déclenche toutes les minutes et au démarrage.
+[Unit]
+Description=Claude Code Remote Control : vérifie et relance la session %i
+Documentation=https://code.claude.com/docs/en/remote-control
+# Rien à faire si l'instance n'a pas de fichier de configuration.
+ConditionPathExists=%E/claude-rc/%i.env
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/lib/claude-rc/claude-rc-ensure %i
+# ESSENTIEL : tmux et claude sont lancés PAR ce script mais doivent lui survivre.
+# Avec la valeur par défaut (control-group), systemd les tuerait dès la fin du script
+# (panne constatée le 24/09/2026 : sessions mortes à chaque passage du minuteur).
+KillMode=process
+# Les services utilisateur n'ont pas ~/.local/bin dans leur PATH (là où se trouve `claude`).
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+TimeoutStartSec=120

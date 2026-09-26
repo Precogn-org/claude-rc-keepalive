@@ -1,0 +1,18 @@
+# claude-rc-keepalive : minuteur « modèle ». Active claude-rc@<id>.service :
+#  - 60 s après le démarrage de la machine (laisse au réseau le temps d'arriver),
+#  - puis 60 s après la fin de chaque vérification.
+# Sans « loginctl enable-linger <utilisateur> », le gestionnaire utilisateur (et donc ce minuteur)
+# ne démarre qu'à la première connexion : vérifier avec `loginctl show-user $USER -p Linger`.
+[Unit]
+Description=Vérification chaque minute de la session Remote Control %i
+
+[Timer]
+OnBootSec=60s
+OnUnitInactiveSec=60s
+# Précision par défaut = 1 min (mesuré le 25/09 : détection après 69 s) ; on la ramène à 1 s.
+AccuracySec=1s
+# Étale d'au plus 10 s les lancements quand plusieurs instances existent (évite N démarrages simultanés au boot).
+RandomizedDelaySec=10s
+
+[Install]
+WantedBy=timers.target
