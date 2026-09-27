@@ -122,6 +122,32 @@ claude-rc-ctl list
 - Les dossiers de travail doivent être **absolus et durables** : `/tmp`, `/var/tmp`, `/dev/shm` et `/run` sont refusés
   (vidés au démarrage). Deux instances ne peuvent partager ni le nom ni le dossier.
 
+## Migrer une session pré-existante
+
+Transformer une session Claude Code déjà en cours ailleurs (ton PC, une autre machine) en instance keepalive
+démarre toujours une **conversation claude.ai neuve** sur la nouvelle machine : `--fresh` ne peut pas reprendre
+une session qu'il n'a jamais servie, et il n'existe aucun moyen de transplanter l'historique d'une conversation
+d'une machine à l'autre. La nouvelle instance part donc vide. Pour ne pas perdre le fil :
+
+1. **Choisis le dossier de travail réellement utilisé par l'ancienne session** — pas celui affiché par son hôte
+   (un dossier de lancement générique n'est souvent pas la vraie racine du projet), mais les dossiers qu'elle dit
+   réellement modifier. En cas de doute, demande-le-lui directement (en lecture seule).
+2. **Écris le contexte réel du projet dans un `CLAUDE.md`** placé dans le nouveau dossier de travail : quels
+   dépôts elle peut modifier, lesquels sont seulement des dépendances, le mode de travail (branche/PR) en usage,
+   ce qui exige une validation humaine explicite. Reste court : c'est un contexte pour la *nouvelle* session, pas
+   une archive.
+3. **Ajoute le ou les derniers échanges, tels quels**, tirés de la transcription de l'ancienne session, pour que
+   la nouvelle reprenne le fil au lieu de deviner. Un court extrait cité suffit ; ne rejoue pas tout l'historique.
+4. **Crée puis démarre la nouvelle instance** (`claude-rc-ctl create` puis `fresh --yes`), puis **vérifie** que
+   le contexte a bien été chargé : demande-le, via un appel `claude -p` jetable, de résumer ce qu'elle vient de
+   lire ; compare avec ce que tu as écrit.
+5. **Archive ou arrête l'ancienne session seulement ensuite.** Garde les deux joignables tant que tu n'as pas
+   confirmé que la nouvelle a le contexte nécessaire — archiver se défait, mais perdre l'ancienne session avant
+   d'avoir vérifié la nouvelle ne se rattrape pas après coup.
+
+La conversation complète de l'ancienne session reste l'archive de ce qui a été décidé et pourquoi ; le nouveau
+`CLAUDE.md` n'est que ce dont la prochaine session a besoin pour continuer. Ne confonds pas les deux.
+
 ## Désinstallation
 
 ```bash

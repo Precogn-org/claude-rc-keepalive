@@ -122,6 +122,31 @@ claude-rc-ctl list
 - Working directories must be **absolute and durable**: `/tmp`, `/var/tmp`, `/dev/shm` and `/run` are refused (emptied at boot).
   Two instances cannot share the same name or folder.
 
+## Migrating a pre-existing session
+
+Turning an existing Claude Code session (running elsewhere — your laptop, another machine) into a keepalive
+instance always starts a **brand-new claude.ai conversation** on the new host: `--fresh` cannot resume a
+session it never served, and there is no way to transplant a conversation's history between machines. The new
+instance therefore starts empty. To avoid losing continuity:
+
+1. **Pick the working directory the old session actually used** — not the directory its host displayed (a
+   generic launch folder often isn't the real project root), but the directories it reports really editing.
+   If you're unsure, ask that session directly (in read-only mode) what it works on and where.
+2. **Write that project's real context into a `CLAUDE.md` in the new working directory**: which repositories
+   it may edit vs. only depends on, the branch/PR workflow in use, what needs a human's explicit approval.
+   Keep this short — it's a context file for the *new* session, not an archive.
+3. **Append the last exchange or two verbatim** from the old session's transcript, so the new session can pick
+   up mid-thread instead of guessing. A short quoted excerpt is enough; don't try to replay the whole history.
+4. **Create and start the new instance** (`claude-rc-ctl create` then `fresh --yes`), then **verify** the
+   context actually loaded — ask the new session, in a throwaway `claude -p` call, to summarize what it just
+   read; compare against what you wrote.
+5. **Only then archive or stop the old session.** Keep both reachable until you've confirmed the new one has
+   the context it needs — archiving is reversible, but losing an old session before checking the new one is
+   not something you want to discover after the fact.
+
+The old session's full conversation remains the archive of what was decided and why; the new `CLAUDE.md` is
+only what the next session needs to keep working. Don't conflate the two.
+
 ## Uninstall
 
 ```bash
