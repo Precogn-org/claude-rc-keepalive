@@ -173,6 +173,23 @@ tmux attach -t rc-<id>                   # regarder/piloter la session dans un t
 
 `start`, `restart` et `fresh` sont des décisions humaines : elles remettent aussi le compteur anti-boucle à zéro.
 
+## Faire parler les sessions entre elles
+
+Chaque instance maintenue est un processus `claude remote-control` indépendant : rien ici ne les rend conscientes
+les unes des autres. Si une session essaie de joindre une autre avec **`mcp__ccd_session_mgmt__send_message`** —
+l'outil utilisé par les sessions que l'app Claude Code Desktop lance ou suit elle-même — elle échoue généralement à
+atteindre une instance `claude remote-control` autonome, car ce registre ne connaît que les sessions gérées par
+l'app.
+
+Il existe une **paire `SendMessage` / `ListAgents` native, distincte**, indépendante de l'app Desktop, qui atteint
+bien ces instances (testé et confirmé sur 2.1.283, dans les deux sens, vérifié directement dans la transcription du
+destinataire — pas seulement une réponse `success: true`). Si une session doit contacter une autre instance
+maintenue, dis-lui d'utiliser l'outil `SendMessage` natif, pas `ccd_session_mgmt`. Voir
+[anthropics/claude-code#89938](https://github.com/anthropics/claude-code/issues/89938) pour le contexte : la
+messagerie inter-sessions par le chemin suivi par l'app a un bug de livraison connu, encore ouvert, sur exactement
+cette configuration (sessions `claude remote-control --spawn=same-dir` longue durée dans tmux) ; le chemin natif
+n'était pas affecté dans nos tests.
+
 ## Configuration (`~/.config/claude-rc/<id>.env`)
 
 Syntaxe shell, **aucun secret**. Voir [conf/session.env.example](conf/session.env.example).
